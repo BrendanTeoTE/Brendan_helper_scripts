@@ -1,0 +1,388 @@
+from pathlib import Path
+import json
+
+configfile: "config/samples.json"
+
+ROOT = Path.cwd()
+WORK = ROOT / "work"
+REFS = WORK / "references"
+META = WORK / "meta"
+SIM  = WORK / "simulated"
+
+SAMPLES = [s for s in config.keys() if not s.startswith("_")]
+SR_DEPTHS = {s: config[s]["shortreads_depth"] for s in SAMPLES}
+LR_DEPTHS = {s: config[s]["longreads_depth"]  for s in SAMPLES}
+
+rule all:
+    input:
+        [ META / s / "profile.parsed.tsv"            for s in SAMPLES ],
+        [ META / s / "resolved_genomes.tsv"          for s in SAMPLES ],
+        [ REFS / s / "genomes" / "combined.fna"      for s in SAMPLES ],
+        [ SIM / s / "short" / f"d{d}" / "reads_1.fq.gz"
+          for s in SAMPLES for d in SR_DEPTHS[s] ],
+        [ SIM / s / "short" / f"d{d}" / "reads_2.fq.gz"
+          for s in SAMPLES for d in SR_DEPTHS[s] ],
+        [ SIM / s / "long"  / f"d{d}" / "reads.fq.gz"
+          for s in SAMPLES for d in LR_DEPTHS[s] ]
+
+
+#Parse Sylph profile
+rule parse_profile:
+    input:
+        lambda wc: config[wc.sample]["profile"]
+    output:
+        META / "{sample}" / "profile.parsed.tsv"
+    shell:
+        r"""
+        mkdir -p {META}/{wildcards.sample}
+        python scripts/parse_sylph_profile.py --in "{input}" --out "{output}"
+        """
+
+# identify what files to download
+checkpoint resolve_genomes:
+    input:
+        META / "{sample}" / "profile.parsed.tsv"
+    output:
+        META / "{sample}" / "resolved_genomes.tsv"
+    shell:
+        r"""
+        python scripts/resolve_genomes.py --in "{input}" --out "{output}"
+        """
+
+# global constraints 
+wildcard_constraints:
+    d = r"\d+",
+    label = r"[A-Za-z0-9_.-]+"
+
+# helpers that depend on the checkpoint
+
+def labels_from_resolved(wc):
+    """List labels for this sample (after resolve_genomes)."""
+    resolved = checkpoints.resolve_genomes.get(sample=wc.sample).output[0]
+    labels = []
+    with open(resolved) as f:
+        first = f.readline().rstrip("\n")
+        if first and ("\t" not in first or "label" not in first):
+            labels.append(first.split("\t")[0])
+        for line in f:
+            line = line.strip()
+            if line:
+                labels.append(line.split("\t")[0])
+    return labels
+
+def lookup_resolved(wc):
+    tsv = checkpoints.resolve_genomes.get(sample=wc.sample).output[0]
+    with open(tsv) as f:
+        header = f.readline().rstrip("\n").split("\t")
+        cols = {h: i for i, h in enumerate(header)}
+        for line in f:
+            if not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if parts[0] == wc.label:
+                return parts[cols["qtype"]], parts[cols["qval"]]
+    raise ValueError(f"Label {wc.label} not found in {tsv}")
+
+# Download one FASTA (FNA) per label
+
+rule fetch_genome:
+    input:
+        META / "{sample}" / "resolved_genomes.tsv"
+    output:
+        REFS / "{sample}" / "genomes" / "raw" / "{label}" / "{label}.fna"
+    params:
+        qtype = lambda wc: lookup_resolved(wc)[0],
+        qval  = lambda wc: lookup_resolved(wc)[1]
+    shell:
+        r"""
+        set -euo pipefail
+        outdir="{REFS}/{wildcards.sample}/genomes/raw/{wildcards.label}"
+        mkdir -p "$outdir"
+        pkg="$outdir/pkg.zip"
+        tmpfna="$outdir/.tmp.fna"
+        gzlist="$outdir/fna_gz.list"
+        fnalist="$outdir/fna_plain.list"
+
+        KEYFLAG=""
+        if [ -n "$NCBI_API_KEY" ]; then
+          KEYFLAG="--api-key $NCBI_API_KEY"
+        fi
+
+        # Download the dataset package to a file
+        if [ "{params.qtype}" = "accession" ]; then
+          datasets download genome accession "{params.qval}" --include genome $KEYFLAG --filename "$pkg"
+        elif [ "{params.qtype}" = "taxon" ] || [ "{params.qtype}" = "name" ]; then
+          datasets download genome taxon "{params.qval}" --reference --assembly-source refseq --include genome $KEYFLAG --filename "$pkg"
+        else
+          echo "Unknown qtype '{params.qtype}' for label {wildcards.label}" >&2
+          exit 2
+        fi
+
+        # unzip
+        unzip -Z1 "$pkg" | grep -E '\.fna\.gz$' >  "$gzlist"   || true
+        unzip -Z1 "$pkg" | grep -E '\.fna$'     >  "$fnalist"  || true
+
+        # if both lists are empty
+        if [ ! -s "$gzlist" ] && [ ! -s "$fnalist" ]; then
+          echo "No .fna(.gz) entries found in $pkg for {wildcards.label}" >&2
+          exit 3
+        fi
+
+        : > "$tmpfna"
+        # extract gz files first
+        if [ -s "$gzlist" ]; then
+          while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            unzip -p "$pkg" "$m" | gzip -cd >> "$tmpfna"
+          done < "$gzlist"
+        fi
+        # then plain .fna
+        if [ -s "$fnalist" ]; then
+          while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            # skip any that are actually .fna.gz (defensive)
+            case "$m" in
+              *.fna.gz) continue ;;
+            esac
+            unzip -p "$pkg" "$m" >> "$tmpfna"
+          done < "$fnalist"
+        fi
+
+        mv "$tmpfna" "{output}"
+        rm -f "$pkg" "$gzlist" "$fnalist"
+        test -s "{output}"
+        """
+
+
+# Combine per-label FASTAs & compute sizes
+
+def species_fna_inputs(wc):
+    return [REFS / wc.sample / "genomes" / "raw" / lab / f"{lab}.fna"
+            for lab in labels_from_resolved(wc)]
+
+rule combine_genomes:
+    input:
+        species_fna_inputs
+    output:
+        REFS / "{sample}" / "genomes" / "combined.fna",
+        REFS / "{sample}" / "genomes" / "sizes.tsv"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {REFS}/{wildcards.sample}/genomes
+
+        # Concatenate all genomes
+        cat {input} > "{output[0]}"
+
+        # sizes.tsv: label \t total_bp (sum per input file, ignoring headers)
+        : > "{output[1]}"
+        for f in {input}; do
+          # parent dir is the label: .../raw/<LABEL>/<LABEL>.fna
+          lab="$(basename "$(dirname "$f")")"
+          bp=$(awk 'BEGIN{{L=0}} /^>/{{next}} {{L+=length($0)}} END{{print L}}' "$f")
+          printf "%s\t%s\n" "$lab" "$bp" >> "{output[1]}"
+        done
+        """
+
+
+#compute depth
+
+def gb_to_bases(gb):
+    return int(float(gb) * 1_000_000_000)  # or 1024**3 if you prefer GiB
+
+rule plan_short_depth:
+    input:
+        profile = META / "{sample}" / "profile.parsed.tsv",
+        sizes   = REFS / "{sample}" / "genomes" / "sizes.tsv"
+    output:
+        META / "{sample}" / "plans" / "short_d{d}.tsv"
+    params:
+        # reinterpret {d} as GB; compute a budget in bases
+        budget_bases = lambda wc: gb_to_bases(wc.d)
+    shell:
+        r"""
+        mkdir -p {META}/{wildcards.sample}/plans
+        python scripts/compute_coverages.py \
+          --profile "{input.profile}" \
+          --sizes   "{input.sizes}" \
+          --budget-bases {params.budget_bases} \
+          --out     "{output}"
+        """
+
+rule plan_long_depth:
+    input:
+        profile = META / "{sample}" / "profile.parsed.tsv",
+        sizes   = REFS / "{sample}" / "genomes" / "sizes.tsv"
+    output:
+        META / "{sample}" / "plans" / "long_d{d}.tsv"
+    params:
+        budget_bases = lambda wc: gb_to_bases(wc.d)
+    shell:
+        r"""
+        mkdir -p {META}/{wildcards.sample}/plans
+        python scripts/compute_coverages.py \
+          --profile "{input.profile}" \
+          --sizes   "{input.sizes}" \
+          --budget-bases {params.budget_bases} \
+          --out     "{output}"
+        """
+
+#ISS short reads per species
+
+rule iss_species:
+    input:
+        fasta = REFS / "{sample}" / "genomes" / "raw" / "{label}" / "{label}.fna",
+        plan  = META / "{sample}" / "plans" / "short_d{d}.tsv"
+    output:
+        r1 = SIM / "{sample}" / "short" / "d{d}" / "species" / "{label}" / "R1.fq.gz",
+        r2 = SIM / "{sample}" / "short" / "d{d}" / "species" / "{label}" / "R2.fq.gz"
+    log:
+        SIM / "{sample}" / "short" / "d{d}" / "species" / "{label}" / "iss.log"
+    conda: "envs/iss.yml"
+    shell:
+        r"""
+        set -euo pipefail
+        out="{SIM}/{wildcards.sample}/short/d{wildcards.d}/species/{wildcards.label}"
+        mkdir -p "$out"
+
+        # 1) Coverage for this species from the plan
+        COV=$(awk -v L="{wildcards.label}" '$1==L{{print $2}}' "{input.plan}" | tr -d '\r')
+        test -n "$COV" && awk "BEGIN{{exit(!($COV>=0))}}"
+
+        # 2) Build a coverage file with ONE LINE PER FASTA RECORD (header ID \t coverage)
+        covfile=$(mktemp)
+        awk -v cov="$COV" '/^>/{{ id=$$0; sub(/^>/,"",id); split(id, a, /[ \t]/); print a[1] "\t" cov }}' "{input.fasta}" > "$covfile"
+
+        # 3) Run ISS
+        iss generate \
+        --genomes "{input.fasta}" \
+        --model hiseq \
+        --cpus 1 \
+        --coverage_file "$covfile" \
+        --output "$out/reads" \
+        --compress \
+        &> "{log}"
+
+        rm -f "$covfile"
+
+        # 4) Move outputs
+        mv "$out/reads_R1.fastq.gz" "{output.r1}"
+        mv "$out/reads_R2.fastq.gz" "{output.r2}"
+        """
+
+
+def species_r1_inputs(wc):
+    d = int(wc.d)
+    return [SIM / wc.sample / "short" / f"d{d}" / "species" / lab / "R1.fq.gz"
+            for lab in labels_from_resolved(wc)]
+
+def species_r2_inputs(wc):
+    d = int(wc.d)
+    return [SIM / wc.sample / "short" / f"d{d}" / "species" / lab / "R2.fq.gz"
+            for lab in labels_from_resolved(wc)]
+
+rule pool_short:
+    input:
+        r1 = species_r1_inputs,
+        r2 = species_r2_inputs
+    output:
+        r1 = SIM / "{sample}" / "short" / "d{d}" / "reads_1.fq.gz",
+        r2 = SIM / "{sample}" / "short" / "d{d}" / "reads_2.fq.gz"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {SIM}/{wildcards.sample}/short/d{wildcards.d}
+        cat {input.r1} > "{output.r1}"
+        cat {input.r2} > "{output.r2}"
+        """
+
+# Badread long reads per species
+
+rule badread_species:
+    input:
+        fasta = REFS / "{sample}" / "genomes" / "raw" / "{label}" / "{label}.fna",
+        plan  = META / "{sample}" / "plans" / "long_d{d}.tsv"
+    output:
+        fq = SIM / "{sample}" / "long" / "d{d}" / "species" / "{label}" / "reads.fq.gz"
+    log:
+        SIM / "{sample}" / "long" / "d{d}" / "species" / "{label}" / "badread.err"
+    shell:
+        r"""
+        set -euo pipefail
+        OUTDIR="{SIM}/{wildcards.sample}/long/d{wildcards.d}/species/{wildcards.label}"
+        mkdir -p "$OUTDIR"
+
+        COV=$(awk -v L="{wildcards.label}" '$1==L{{print $2}}' "{input.plan}" | tr -d '\r')
+        test -n "$COV" && awk "BEGIN{{exit(!($COV>=0))}}"
+
+        REF="{input.fasta}"
+
+        badread simulate \
+          --reference "$REF" \
+          --quantity "${{COV}}x" \
+          --length 10000,3000 \
+          --qscore_model nanopore2023 \
+          --error_model nanopore2023 \
+          --identity 90,98,5 \
+          --junk_reads 0 --random_reads 0 \
+          2> "{log}" \
+        | gzip -c > "{output.fq}"
+        """
+
+
+
+
+def species_long_inputs(wc):
+    d = int(wc.d)
+    return [SIM / wc.sample / "long" / f"d{d}" / "species" / lab / "reads.fq.gz"
+            for lab in labels_from_resolved(wc)]
+
+rule pool_long:
+    input:
+        species_long_inputs
+    output:
+        SIM / "{sample}" / "long" / "d{d}" / "reads.fq.gz"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {SIM}/{wildcards.sample}/long/d{wildcards.d}
+        cat {input} > "{output}"
+        """
+
+rule cleanup_species_short:
+    input:
+        SIM / "{sample}" / "short" / "d{d}" / "reads_1.fq.gz",
+        SIM / "{sample}" / "short" / "d{d}" / "reads_2.fq.gz"
+    output:
+        done = SIM / "{sample}" / "short" / "d{d}" / ".species.cleaned"
+    params:
+        species_dir = SIM / "{sample}" / "short" / "d{d}" / "species",
+        root_dir    = SIM / "{sample}" / "short"
+    shell:
+        r"""
+        set -euo pipefail
+        dir="{params.species_dir}"
+        base="{params.root_dir}"
+        # safety: only delete if under the expected base
+        case "$dir" in "$base"/*) ;; *) echo "Refusing to delete $dir"; exit 2;; esac
+        if [ -d "$dir" ]; then rm -rf "$dir"; fi
+        : > "{output.done}"
+        """
+
+rule cleanup_species_long:
+    input:
+        SIM / "{sample}" / "long" / "d{d}" / "reads.fq.gz"
+    output:
+        done = SIM / "{sample}" / "long" / "d{d}" / ".species.cleaned"
+    params:
+        species_dir = SIM / "{sample}" / "long" / "d{d}" / "species",
+        root_dir    = SIM / "{sample}" / "long"
+    shell:
+        r"""
+        set -euo pipefail
+        dir="{params.species_dir}"
+        base="{params.root_dir}"
+        case "$dir" in "$base"/*) ;; *) echo "Refusing to delete $dir"; exit 2;; esac
+        if [ -d "$dir" ]; then rm -rf "$dir"; fi
+        : > "{output.done}"
+        """

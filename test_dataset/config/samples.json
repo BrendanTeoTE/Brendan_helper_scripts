@@ -1,0 +1,7 @@
+{
+  "ERR7671960": {
+    "profile": "ERR7671960.profile.tsv",
+    "shortreads_depth": [10],
+    "longreads_depth":  [10]
+  }
+}

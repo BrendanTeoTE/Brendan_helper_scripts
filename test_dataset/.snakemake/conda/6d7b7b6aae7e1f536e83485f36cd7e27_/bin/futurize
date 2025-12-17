@@ -1,0 +1,7 @@
+#!/mnt/operams/test_dataset/.snakemake/conda/6d7b7b6aae7e1f536e83485f36cd7e27_/bin/python
+import sys
+from libfuturize.main import main
+if __name__ == '__main__':
+    if sys.argv[0].endswith('.exe'):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(main())

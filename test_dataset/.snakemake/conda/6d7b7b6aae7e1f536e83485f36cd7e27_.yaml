@@ -1,0 +1,13 @@
+name: iss-pip
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - insilicoseq==1.5.4
+      - biopython==1.77
+      - numpy<2
+
