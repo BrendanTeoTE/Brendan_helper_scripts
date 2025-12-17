@@ -1,5 +1,0 @@
-#!/mnt/operams/test_dataset/.snakemake/conda/6d7b7b6aae7e1f536e83485f36cd7e27_/bin/python3.11
-import sys
-from lib2to3.main import main
-
-sys.exit(main("lib2to3.fixes"))

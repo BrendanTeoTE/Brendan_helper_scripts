@@ -1,5 +1,0 @@
-#!/mnt/operams/test_dataset/.snakemake/conda/6d7b7b6aae7e1f536e83485f36cd7e27_/bin/python3.11
-
-from idlelib.pyshell import main
-if __name__ == '__main__':
-    main()
