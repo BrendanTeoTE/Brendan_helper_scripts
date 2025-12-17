@@ -5,7 +5,8 @@ test_dataset is a pipeline used to generate simulated reads from an initial sylp
 Run it like this.
 ```
 export NCBI_API_KEY=your_ncbi_key
-snakemake -c 32 -p --configfile config/samples.json --rerun-triggers mtime --use-conda--dry-run --rerun-incomplete 
+snakemake -c 32 -p --configfile config/samples.json --rerun-triggers mtime --use-conda--dry-run --rerun-incomplete
+```
 
 # Downsampling
 
@@ -19,5 +20,6 @@ Run it like this.
                       -g {Target number of bases (in GB)} \
                       -o {Outdir} \
                       -t 1 \
+```
                       
                     
