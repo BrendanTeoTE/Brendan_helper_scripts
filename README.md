@@ -8,20 +8,20 @@ Edit the config file, config.large.json, with the name of the sample, e.g "schoe
 
 Also requires Snakemake installed in the environment. Run this following command from the root directory.
 
-"
+```
 snakemake -c 32 -p --configfile config.large.json --rerun-triggers mtime --keep-going --dry-run
-"
+```
 
 To plot heatmaps from benchmark files in the benchmark folder, use:
 
-"
+```
 python heatmap.py \
   --sample-prefix {name of sample} \
   --dir benchmarks \
   --outdir {path} \
   --metric {wall_time/cpu_time/mean_load/mean_cpu_load/max_rss} \
   --tool {mash/skani}
-"
+```
 
 # Simulating Reads
 
