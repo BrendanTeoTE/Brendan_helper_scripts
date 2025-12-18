@@ -1,0 +1,18 @@
+{
+  "schoenbuch_test": {
+    "source_dir": "/mnt/operams/OPERA-MS-NEW/OPERA-MS",
+    "short_reads": {
+      "SR1": "/mnt/operams/datasets/schoenbuch/ERR15077260/fastq/ERR15077260_1.fastq.gz",
+      "SR2": "/mnt/operams/datasets/schoenbuch/ERR15077260/fastq/ERR15077260_2.fastq.gz",
+      "short_read_gb": ["1", "2", "3", "5", "10"]
+    },
+    "long_reads": {
+      "LR": "/mnt/operams/datasets/schoenbuch/LR/ERR15076229.fastq",
+      "long_read_gb": ["1", "2", "3", "5", "10"]
+    },
+    "outdir": "/mnt/operams/testflow/results/schoenbuch_test",
+    "dist_est": ["skani", "mash"]
+  }
+}
+
+

@@ -1,0 +1,397 @@
+configfile: "config.large.json"
+import os
+EXECUTOR = 'OPERA-MS'
+
+SAMPLES = config.keys()
+
+print(config)
+print(SAMPLES)
+
+def get_short_r1(wc):
+    return config[wc.sample]["short_reads"]["SR1"] if wc.short_gb == "full" \
+        else f"downsampled/{wc.sample}/short_{wc.short_gb}_1.fq.gz"
+
+def get_short_r2(wc):
+    return config[wc.sample]["short_reads"]["SR2"] if wc.short_gb == "full" \
+        else f"downsampled/{wc.sample}/short_{wc.short_gb}_2.fq.gz"
+
+def get_long_read(wc):
+    return config[wc.sample]["long_reads"]["LR"] if wc.long_gb == "full" \
+        else f"downsampled/{wc.sample}/{wc.long_gb}_long.fq"
+
+def outdir(wc):
+    base = config[wc.sample]["outdir"]
+    return f"{base}/{wc.short_gb}_{wc.long_gb}_{wc.dist_est}"
+
+def skani_outdir(wc):
+    base = config[wc.sample]["outdir"]
+    return f"{base}/{wc.short_gb}_{wc.long_gb}_skani"
+
+def dist_flag(wc):
+    return "--dist-est mash" if wc.dist_est == "mash" else ""   # default (skani/sylph) = no flag
+
+def pre_step4_flag(wc):
+    if wc.dist_est == "mash":
+        return f"flags/mash.{wc.sample}.{wc.short_gb}.{wc.long_gb}.prepared.done"
+    else:
+        return f"flags/skani.{wc.sample}.{wc.short_gb}.{wc.long_gb}.step3.done"
+
+CONDITIONS = [
+    (sample, dist, s_gb, l_gb)
+    for sample in SAMPLES
+    for dist in config[sample]["dist_est"]     
+    for s_gb in config[sample]["short_reads"]["short_read_gb"]
+    for l_gb in config[sample]["long_reads"]["long_read_gb"]
+]
+
+TARGETS = [
+    f"flags/{dist}.{sample}.{s_gb}.{l_gb}.step8.done"
+    for (sample, dist, s_gb, l_gb) in CONDITIONS
+]
+
+rule all:
+    input: TARGETS
+
+
+rule compute_short_size:
+    output: "sizes/{sample}.short.size.txt"
+    params:
+        sr1 = lambda wc: config[wc.sample]["short_reads"]["SR1"],
+        sr2 = lambda wc: config[wc.sample]["short_reads"]["SR2"]
+    run:
+        import os
+        os.makedirs(os.path.dirname(output[0]), exist_ok=True)
+        shell(r"""
+            sr1_size=$(seqkit stats -T {params.sr1} | awk 'NR==2 {{print $5}}')
+            sr2_size=$(seqkit stats -T {params.sr2} | awk 'NR==2 {{print $5}}')
+            echo $((sr1_size + sr2_size)) > {output}
+        """)
+
+rule compute_long_size:
+    output: "sizes/{sample}.long.size.txt"
+    params:
+        lr = lambda wc: config[wc.sample]["long_reads"]["LR"]
+    run:
+        import os
+        os.makedirs(os.path.dirname(output[0]), exist_ok=True)
+        shell(r"""
+            lr_size=$(seqkit stats -T {params.lr} | awk 'NR==2 {{print $5}}')
+            echo "$lr_size" > {output}
+        """)
+
+rule downsample_short:
+    input:
+        total_size = "sizes/{sample}.short.size.txt",
+        r1 = lambda wc: config[wc.sample]["short_reads"]["SR1"],
+        r2 = lambda wc: config[wc.sample]["short_reads"]["SR2"]
+    output:
+        r1_out = "downsampled/{sample}/short_{short_gb}_1.fq.gz",
+        r2_out = "downsampled/{sample}/short_{short_gb}_2.fq.gz"
+    params:
+        target_gb = lambda wc: wc.short_gb,
+        outdir = lambda wc: f"downsampled/{wc.sample}",
+        prefix = lambda wc: f"short_{wc.short_gb}"
+    run:
+        if wildcards.short_gb == "full":
+            print("Skipping downsample_short because short_gb == 'full'")
+            return
+        import os
+        os.makedirs(params.outdir, exist_ok=True)
+        shell("""
+            ./downsample.sh \
+                --short-read1 {input.r1} \
+                --short-read2 {input.r2} \
+                --target-gb {params.target_gb} \
+                --size-file {input.total_size} \
+                --outdir {params.outdir} \
+                --prefix {params.prefix}
+        """)
+
+rule downsample_long:
+    input:
+        total_size = "sizes/{sample}.long.size.txt",
+        lr = lambda wc: config[wc.sample]["long_reads"]["LR"]
+    output:
+        lr_out = "downsampled/{sample}/{long_gb}_long.fq"
+    params:
+        target_gb = lambda wc: wc.long_gb,
+        outdir = lambda wc: f"downsampled/{wc.sample}",
+        prefix = lambda wc: f"{wc.long_gb}"
+    run:
+        if wildcards.long_gb == "full":
+            print("Skipping downsample_long because long_gb == 'full'")
+            return
+        import os
+        os.makedirs(params.outdir, exist_ok=True)
+        shell("""
+            ./downsample.sh \
+                --long-read {input.lr} \
+                --target-gb {params.target_gb} \
+                --size-file {input.total_size} \
+                --outdir {params.outdir} \
+                --prefix {params.prefix}
+        """)
+
+
+rule step1:
+    input:
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2
+    output:
+        contigs = "results/{sample}/{short_gb}/intermediate_files/megahit_assembly/final.contigs.fa",
+        done = touch("flags/{sample}.{short_gb}.step1.done")
+    benchmark: "benchmarks/{sample}.{short_gb}.step1.extended.txt"
+    params:
+        exe = EXECUTOR,
+        src = lambda wc: config[wc.sample]["source_dir"],
+        outdir = 'results/{sample}/{short_gb}'
+    threads: 32
+    log: "logs/{sample}.{short_gb}.step1.txt"
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read <(gunzip -c {input.short_r1}) \
+            --out-dir {params.outdir} \
+            --num-processors {threads} \
+            --step 1 \
+            > {log} 2>&1
+    """
+
+rule step2_skani:
+    input:
+        "flags/{sample}.{short_gb}.step1.done",
+        contigs = rules.step1.output['contigs'],
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2,
+        long_reads = get_long_read
+    output:
+        done = touch("flags/skani.{sample}.{short_gb}.{long_gb}.step2.done")
+    benchmark: "benchmarks/skani.{sample}.{short_gb}.{long_gb}.step2.extended.txt"
+    log: "logs/skani.{sample}.{short_gb}.{long_gb}.step2.txt"
+    params:
+        exe = EXECUTOR,
+        src  = lambda wc: config[wc.sample]["source_dir"],
+        outdir = lambda wc: f"{skani_outdir(wc)}"
+    threads: 32
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read {input.long_reads} \
+            --out-dir {params.outdir} \
+            --num-processors {threads} \
+            --step 2 \
+            --contig-file {input.contigs} \
+            > {log} 2>&1
+    """
+
+rule step3_skani:
+    input:
+        "flags/skani.{sample}.{short_gb}.{long_gb}.step2.done",
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2,
+        long_reads = get_long_read,
+        contigs = rules.step1.output['contigs']
+    output:
+        done = touch("flags/skani.{sample}.{short_gb}.{long_gb}.step3.done")
+    benchmark: "benchmarks/skani.{sample}.{short_gb}.{long_gb}.step3.extended.txt"
+    log: "logs/skani.{sample}.{short_gb}.{long_gb}.step3.txt"
+    params:
+        exe = EXECUTOR,
+        src  = lambda wc: config[wc.sample]["source_dir"],
+        outdir = lambda wc: f"{skani_outdir(wc)}"
+    threads: 32
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read {input.long_reads} \
+            --contig-file {input.contigs} \
+            --out-dir {params.outdir} \
+            --num-processors {threads} \
+            --step 3 \
+            > {log} 2>&1
+    """
+
+rule prepare_mash_dir:
+    input:
+        skani_done = "flags/skani.{sample}.{short_gb}.{long_gb}.step3.done"
+    output:
+        done = touch("flags/mash.{sample}.{short_gb}.{long_gb}.prepared.done")
+    params:
+        src = lambda wc: f"{config[wc.sample]['outdir']}/{wc.short_gb}_{wc.long_gb}_skani",
+        dst = lambda wc: f"{config[wc.sample]['outdir']}/{wc.short_gb}_{wc.long_gb}_mash"
+    run:
+        import os
+        os.makedirs(os.path.join(params.dst, "intermediate_files"), exist_ok=True)
+        shell(r"""
+            set -euo pipefail
+
+            # Link the required OPERA-MS intermediates from SKANI into the new MASH outdir
+            for d in coverage_estimation hierarchical_clustering lib_1_bundles opera_long_read read_mapping; do
+                srcd="{params.src}/intermediate_files/$d"
+                dstd="{params.dst}/intermediate_files/$d"
+                if [ -d "$srcd" ]; then
+                    # Remove any existing file/dir/link at destination, then make a fresh symlink
+                    rm -rf "$dstd" 2>/dev/null || true
+                    ln -sfn "$srcd" "$dstd"
+                fi
+            done
+
+            # Link the timing log if present
+            if [ -f "{params.src}/intermediate_files/time.log" ]; then
+                ln -sfn "{params.src}/intermediate_files/time.log" "{params.dst}/intermediate_files/time.log"
+            fi
+        """)
+
+
+rule step4:
+    input:
+        preflag = pre_step4_flag,
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2,
+        long_reads = get_long_read,
+        contigs = rules.step1.output['contigs']
+    output:
+        done = touch("flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step4.done")
+    benchmark: "benchmarks/{dist_est}.{sample}.{short_gb}.{long_gb}.step4.extended.txt"
+    log: "logs/{dist_est}.{sample}.{short_gb}.{long_gb}.step4.txt"
+    params:
+        exe = EXECUTOR,
+        src = lambda wc: config[wc.sample]["source_dir"],
+        outdir = outdir,
+        dist = dist_flag
+    threads: 32
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read {input.long_reads} \
+            --contig-file {input.contigs} \
+            --out-dir {params.outdir} \
+            {params.dist} \
+            --num-processors {threads} \
+            --step 4 \
+            > {log} 2>&1
+    """
+
+rule step5:
+    input:
+        "flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step4.done",
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2,
+        long_reads = get_long_read,
+        contigs = rules.step1.output['contigs']
+    output:
+        done = touch("flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step5.done")
+    benchmark: "benchmarks/{dist_est}.{sample}.{short_gb}.{long_gb}.step5.extended.txt"
+    log: "logs/{dist_est}.{sample}.{short_gb}.{long_gb}.step5.txt"
+    params:
+        exe = EXECUTOR,
+        src = lambda wc: config[wc.sample]["source_dir"],
+        outdir = outdir,
+        dist = dist_flag
+    threads: 32
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read {input.long_reads} \
+            --contig-file {input.contigs} \
+            --out-dir {params.outdir} \
+            {params.dist} \
+            --num-processors {threads} \
+            --step 5 \
+            > {log} 2>&1
+    """
+
+rule step6:
+    input:
+        "flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step5.done",
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2,
+        long_reads = get_long_read,
+        contigs = rules.step1.output['contigs']
+    output:
+        done = touch("flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step6.done")
+    benchmark: "benchmarks/{dist_est}.{sample}.{short_gb}.{long_gb}.step6.extended.txt"
+    log: "logs/{dist_est}.{sample}.{short_gb}.{long_gb}.step6.txt"
+    params:
+        exe = EXECUTOR,
+        src = lambda wc: config[wc.sample]["source_dir"],
+        outdir = outdir,
+        dist = dist_flag
+    threads: 32
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read {input.long_reads} \
+            --contig-file {input.contigs} \
+            --out-dir {params.outdir} \
+            {params.dist} \
+            --num-processors {threads} \
+            --step 6 \
+            > {log} 2>&1
+    """
+
+rule step7:
+    input:
+        "flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step6.done",
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2,
+        long_reads = get_long_read,
+        contigs = rules.step1.output['contigs']
+    output:
+        done = touch("flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step7.done")
+    benchmark: "benchmarks/{dist_est}.{sample}.{short_gb}.{long_gb}.step7.extended.txt"
+    log: "logs/{dist_est}.{sample}.{short_gb}.{long_gb}.step7.txt"
+    params:
+        exe = EXECUTOR,
+        src = lambda wc: config[wc.sample]["source_dir"],
+        outdir = outdir,
+        dist = dist_flag
+    threads: 32
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read {input.long_reads} \
+            --contig-file {input.contigs} \
+            --out-dir {params.outdir} \
+            {params.dist} \
+            --num-processors {threads} \
+            --step 7 \
+            > {log} 2>&1
+    """
+
+rule step8:
+    input:
+        "flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step7.done",
+        short_r1 = get_short_r1,
+        short_r2 = get_short_r2,
+        long_reads = get_long_read,
+        contigs = rules.step1.output['contigs']
+    output:
+        done = touch("flags/{dist_est}.{sample}.{short_gb}.{long_gb}.step8.done")
+    benchmark: "benchmarks/{dist_est}.{sample}.{short_gb}.{long_gb}.step8.extended.txt"
+    log: "logs/{dist_est}.{sample}.{short_gb}.{long_gb}.step8.txt"
+    params:
+        exe = EXECUTOR,
+        src = lambda wc: config[wc.sample]["source_dir"],
+        outdir = outdir,
+        dist = dist_flag
+    threads: 32
+    shell: r"""
+        perl {params.src}/{params.exe}.pl \
+            --short-read1 {input.short_r1} \
+            --short-read2 {input.short_r2} \
+            --long-read {input.long_reads} \
+            --contig-file {input.contigs} \
+            --out-dir {params.outdir} \
+            {params.dist} \
+            --num-processors {threads} \
+            --step 8 \
+            > {log} 2>&1
+    """
