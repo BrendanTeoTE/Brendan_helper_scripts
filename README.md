@@ -6,10 +6,10 @@ This pipeline is able to downsample long read and short reads into a specified s
 
 Edit the config file, config.large.json, with the name of the sample, e.g "schoenbuch_test" in the example. Also input the path to the root directory of OPERA-MS. Select short and long reads, and downsampling target sizes (If no downsampling is required, use "short_read_gb": ["full"], and similarly for long reads). Indicate output directory for results, and the method for reference clustering to be used.
 
-Also requires Snakemake installed in the environment. Run this following command from the root directory.
+Also requires Snakemake installed in the environment. Run this following command from the root directory. (Can add --dry-run argument to check first)
 
 ```
-snakemake -c 32 -p --configfile config.large.json --rerun-triggers mtime --keep-going --dry-run
+snakemake -c 32 -p --configfile config.large.json --rerun-triggers mtime --keep-going
 ```
 
 To plot heatmaps from benchmark files in the benchmark folder, use:
