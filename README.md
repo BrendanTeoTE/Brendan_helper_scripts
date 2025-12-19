@@ -12,17 +12,6 @@ Also requires Snakemake installed in the environment. Run this following command
 snakemake -c 32 -p --configfile config.large.json --rerun-triggers mtime --keep-going
 ```
 
-To plot heatmaps from benchmark files in the benchmark folder, use:
-
-```
-python heatmap.py \
-  --sample-prefix {name of sample} \
-  --dir benchmarks \
-  --outdir {path} \
-  --metric {wall_time/cpu_time/mean_load/mean_cpu_load/max_rss} \
-  --tool {mash/skani}
-```
-
 # Simulating Reads
 
 test_dataset is a pipeline used to generate simulated reads from an initial sylph profile using ISS and badreads. Copy the repository, and add the sylph profile you want to simulate to the root directory. You will need an NCBI key, snakemake, ISS and badreads installed in your conda environment. Edit the configuration file, config/samples.json accordingly, with the sylph profile, and target size of simulated short and long reads.
